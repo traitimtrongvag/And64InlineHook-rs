@@ -17,7 +17,7 @@
 //! - Use raw pointers and direct instruction writes
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! use and64inlinehook::{init_hook_pool, a64_hook_function};
 //!
 //! unsafe {

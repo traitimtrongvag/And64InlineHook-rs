@@ -23,3 +23,4 @@ unsafe {
         // Hook installed, trampoline can call original
     }
 }
+```

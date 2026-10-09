@@ -169,36 +169,41 @@ unsafe fn flush_cache(addr: *const u32, size: usize) {
     
     #[cfg(not(target_os = "android"))]
     {
-        let end = (addr as usize + size) as *const u32;
-        let mut p = addr;
-        while p < end {
-            std::arch::asm!(
-                "dc civac, {0}",
-                in(reg) p,
-                options(nostack)
-            );
-            p = p.add(16); // Cache line size
-        }
+        let ctr: u64;
         std::arch::asm!(
-            "dsb sy",
-            "isb",
-            options(nostack)
+            "mrs {0}, ctr_el0",
+            out(reg) ctr,
+            options(nomem, nostack, preserves_flags)
         );
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        let start = addr as usize;
+        let end = start + size;
+
+        let mut p = start & !(dline - 1);
+        while p < end {
+            std::arch::asm!("dc cvau, {0}", in(reg) p, options(nostack));
+            p += dline;
+        }
+        std::arch::asm!("dsb ish", options(nostack));
+
+        let mut p = start & !(iline - 1);
+        while p < end {
+            std::arch::asm!("ic ivau, {0}", in(reg) p, options(nostack));
+            p += iline;
+        }
+        std::arch::asm!("dsb ish", "isb", options(nostack));
     }
 }
 
 
 unsafe fn make_rwx(addr: *mut u32, size: usize) -> i32 {
-    let page_addr = (addr as usize & !(PAGE_SIZE - 1)) as *mut libc::c_void;
-    let page_size = if (addr as usize + size) & (PAGE_SIZE - 1) != (addr as usize) & (PAGE_SIZE - 1) {
-        ((size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) + PAGE_SIZE
-    } else {
-        (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-    };
+    let start = addr as usize & !(PAGE_SIZE - 1);
+    let end = (addr as usize + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     libc::mprotect(
-        page_addr,
-        page_size,
+        start as *mut libc::c_void,
+        end - start,
         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     )
 }
@@ -224,7 +229,7 @@ unsafe fn fix_branch_imm(
             let special_fix_type = ctx.is_in_fixing_range(absolute_addr);
 
             if !special_fix_type && new_pc_offset.abs() >= (RMASK >> 1) as i64 {
-                let b_aligned = (*outp.add(2) as u64 & 7) == 0;
+                let b_aligned = (outp.add(2) as u64 & 7) == 0;
                 if opc == OP_B {
                     if !b_aligned {
                         **outp = A64_NOP;
@@ -308,7 +313,7 @@ unsafe fn fix_cond_comp_test_branch(
     let special_fix_type = ctx.is_in_fixing_range(absolute_addr);
 
     if !special_fix_type && new_pc_offset.abs() >= (!lmask >> (LSB + 1)) as i64 {
-        if (*outp.add(4) as u64 & 7) != 0 {
+        if (outp.add(4) as u64 & 7) != 0 {
             **outp = A64_NOP;
             *outp = outp.add(1);
             ctx.reset_current_ins(current_idx, *outp);
@@ -349,7 +354,8 @@ unsafe fn fix_loadlit(
 
     // Skip PRFM instruction
     if (ins & 0xff000000) == 0xd8000000 {
-        ctx.process_fix_map(ctx.get_and_set_current_index(*inp, *outp));
+        let idx = ctx.get_and_set_current_index(*inp, *outp);
+        ctx.process_fix_map(idx);
         *inp = inp.add(1);
         return true;
     }
@@ -389,7 +395,7 @@ unsafe fn fix_loadlit(
     let special_fix_type = ctx.is_in_fixing_range(absolute_addr);
 
     if special_fix_type || (new_pc_offset.abs() + ((faligned + 1 - 4) / 4) as i64) >= (!LMASK >> (LSB + 1)) as i64 {
-        while (*outp.add(2) as usize & faligned) != 0 {
+        while (outp.add(2) as usize & faligned) != 0 {
             **outp = A64_NOP;
             *outp = outp.add(1);
         }
@@ -444,7 +450,7 @@ unsafe fn fix_pcreladdr(
             let special_fix_type = ctx.is_in_fixing_range(absolute_addr);
 
             if !special_fix_type && new_pc_offset.abs() >= (MAX_VAL >> 1) as i64 {
-                if (*outp.add(2) as u64 & 7) != 0 {
+                if (outp.add(2) as u64 & 7) != 0 {
                     **outp = A64_NOP;
                     *outp = outp.add(1);
                     ctx.reset_current_ins(current_idx, *outp);
@@ -476,14 +482,15 @@ unsafe fn fix_pcreladdr(
         OP_ADRP => {
             let current_idx = ctx.get_and_set_current_index(*inp, *outp);
             let lsb_bytes = ((ins << 1) >> 30) as i32;
-            let absolute_addr = ((*inp as i64) & !0xfff) + ((((((ins << MSB) as i32) >> (MSB + LSB - 2)) & !3) | lsb_bytes) as i64) << 12;
+            let page_delta = (((((ins << MSB) as i32) >> (MSB + LSB - 2)) & !3) | lsb_bytes) as i64;
+            let absolute_addr = ((*inp as i64) & !0xfff) + (page_delta << 12);
 
             log_info!("ins = 0x{:08X}, pc = {:p}, abs_addr = {:p}", ins, *inp, absolute_addr as *const u8);
 
 			if ctx.is_in_fixing_range(absolute_addr) {
 			    log_error!("ADRP pointing to hook region not fully supported!");
 			    // Fallback: load absolute address
-			    if (*outp.add(2) as u64 & 7) != 0 {
+			    if (outp.add(2) as u64 & 7) != 0 {
 			        **outp = A64_NOP;
 			        *outp = outp.add(1);
 			        ctx.reset_current_ins(current_idx, *outp);
@@ -493,7 +500,7 @@ unsafe fn fix_pcreladdr(
 			    ptr::copy_nonoverlapping(&absolute_addr as *const i64 as *const u32, outp.add(2), 2);
 			    *outp = outp.add(4);
 			} else {
-                if (*outp.add(2) as u64 & 7) != 0 {
+                if (outp.add(2) as u64 & 7) != 0 {
                     **outp = A64_NOP;
                     *outp = outp.add(1);
                     ctx.reset_current_ins(current_idx, *outp);
@@ -536,7 +543,8 @@ unsafe fn fix_instructions(mut inp: *const u32, count: i32, mut outp: *mut u32) 
             continue;
         }
 
-        ctx.process_fix_map(ctx.get_and_set_current_index(inp, outp));
+        let idx = ctx.get_and_set_current_index(inp, outp);
+        ctx.process_fix_map(idx);
         *outp = *inp;
         outp = outp.add(1);
         inp = inp.add(1);
@@ -545,7 +553,7 @@ unsafe fn fix_instructions(mut inp: *const u32, count: i32, mut outp: *mut u32) 
 
     const MASK: u64 = 0x03ffffff;
     let callback = inp as i64;
-    let mut pc_offset = (callback - outp as i64) >> 2;
+    let pc_offset = (callback - outp as i64) >> 2;
 
     if pc_offset.abs() >= (MASK >> 1) as i64 {
         if (outp.add(2) as u64 & 7) != 0 {
@@ -561,7 +569,7 @@ unsafe fn fix_instructions(mut inp: *const u32, count: i32, mut outp: *mut u32) 
         outp = outp.add(1);
     }
 
-    let total = (outp as usize - outp_base as usize);
+    let total = outp as usize - outp_base as usize;
     flush_cache(outp_base, total);
 }
 
